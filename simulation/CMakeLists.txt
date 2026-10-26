@@ -15,4 +15,5 @@ target_link_libraries(bufferbloat PRIVATE
     ns3-point-to-point
     ns3-applications
     ns3-traffic-control
+    ns3-flow-monitor
 )

@@ -174,6 +174,53 @@ static void handle_api_status(int client_fd) {
     send_response(client_fd, 200, "OK", "application/json", resp, len);
 }
 
+// Validation helpers
+static bool is_safe_basename(const char* str) {
+    if (!str || strlen(str) == 0 || strlen(str) > 200) return false;
+    if (strstr(str, "..") != NULL) return false;
+    for (size_t i = 0; i < strlen(str); ++i) {
+        char c = str[i];
+        if (!isalnum(c) && c != '_' && c != '-' && c != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_allowed_file_extension(const char* path) {
+    const char* dot = strrchr(path, '.');
+    if (!dot) return false;
+    return (strcmp(dot, ".csv") == 0 ||
+            strcmp(dot, ".xml") == 0 ||
+            strcmp(dot, ".json") == 0 ||
+            strcmp(dot, ".txt") == 0 ||
+            strcmp(dot, ".log") == 0);
+}
+
+static bool normalize_queue_type(const char* input, char* out_val, size_t max_len) {
+    if (!input || strlen(input) == 0) {
+        snprintf(out_val, max_len, "DropTail");
+        return true;
+    }
+    if (strcasecmp(input, "DropTail") == 0 || strcasecmp(input, "Fifo") == 0) {
+        snprintf(out_val, max_len, "DropTail");
+        return true;
+    } else if (strcasecmp(input, "CoDel") == 0) {
+        snprintf(out_val, max_len, "CoDel");
+        return true;
+    } else if (strcasecmp(input, "RED") == 0) {
+        snprintf(out_val, max_len, "RED");
+        return true;
+    } else if (strcasecmp(input, "FqCoDel") == 0 || strcasecmp(input, "FQ-CoDel") == 0) {
+        snprintf(out_val, max_len, "FqCoDel");
+        return true;
+    } else if (strcasecmp(input, "PIE") == 0) {
+        snprintf(out_val, max_len, "PIE");
+        return true;
+    }
+    return false;
+}
+
 // Handle POST /api/simulate
 static void handle_api_simulate(int client_fd, const char* body) {
     check_simulation_status();
@@ -184,6 +231,14 @@ static void handle_api_simulate(int client_fd, const char* body) {
         return;
     }
 
+    // Verify simulation executable exists and is executable
+    if (access(g_server_state.sim_bin, X_OK) != 0) {
+        const char* err = "{\"error\":\"Simulation executable not found or not executable. Please run 'make simulation/bufferbloat'.\"}";
+        send_response(client_fd, 500, "Internal Server Error", "application/json", err, strlen(err));
+        return;
+    }
+
+    char raw_queue_type[32] = "DropTail";
     char queue_type[32] = "DropTail";
     char queue_size[16] = "100";
     char bottleneck_bw[16] = "5.0";
@@ -191,12 +246,15 @@ static void handle_api_simulate(int client_fd, const char* body) {
     char access_bw[16] = "100.0";
     char access_delay[16] = "2.0";
     char n_clients[16] = "3";
-    char traffic_load[16] = "high";
+    char traffic_load[32] = "high";
     char packet_size[16] = "1024";
     char sim_duration[16] = "15.0";
     char rng_run[16] = "1";
+    char tcp_proto[32] = "Cubic";
+    char enable_udp[16] = "0";
     char exp_name[MAX_EXP_NAME] = "";
-    parse_json_str(body, "queueType", queue_type, sizeof(queue_type));
+
+    parse_json_str(body, "queueType", raw_queue_type, sizeof(raw_queue_type));
     parse_json_str(body, "queueSize", queue_size, sizeof(queue_size));
     parse_json_str(body, "bottleneckBw", bottleneck_bw, sizeof(bottleneck_bw));
     parse_json_str(body, "bottleneckDelay", bottleneck_delay, sizeof(bottleneck_delay));
@@ -207,10 +265,11 @@ static void handle_api_simulate(int client_fd, const char* body) {
     parse_json_str(body, "packetSize", packet_size, sizeof(packet_size));
     parse_json_str(body, "simDuration", sim_duration, sizeof(sim_duration));
     parse_json_str(body, "rngRun", rng_run, sizeof(rng_run));
+    parse_json_str(body, "tcpProtocol", tcp_proto, sizeof(tcp_proto));
+    parse_json_str(body, "enableUdp", enable_udp, sizeof(enable_udp));
     parse_json_str(body, "expName", exp_name, sizeof(exp_name));
 
-    // Fallback defaults and validation
-    if (strlen(queue_type) == 0) snprintf(queue_type, sizeof(queue_type), "DropTail");
+    // Fallback defaults if empty strings provided
     if (strlen(queue_size) == 0) snprintf(queue_size, sizeof(queue_size), "100");
     if (strlen(bottleneck_bw) == 0) snprintf(bottleneck_bw, sizeof(bottleneck_bw), "5.0");
     if (strlen(bottleneck_delay) == 0) snprintf(bottleneck_delay, sizeof(bottleneck_delay), "35.0");
@@ -221,8 +280,99 @@ static void handle_api_simulate(int client_fd, const char* body) {
     if (strlen(packet_size) == 0) snprintf(packet_size, sizeof(packet_size), "1024");
     if (strlen(sim_duration) == 0) snprintf(sim_duration, sizeof(sim_duration), "15.0");
     if (strlen(rng_run) == 0) snprintf(rng_run, sizeof(rng_run), "1");
+    if (strlen(tcp_proto) == 0) snprintf(tcp_proto, sizeof(tcp_proto), "Cubic");
 
-    if (strlen(exp_name) == 0 || !is_safe_filename(exp_name)) {
+    // Strict validation of queue type
+    if (!normalize_queue_type(raw_queue_type, queue_type, sizeof(queue_type))) {
+        char err[256];
+        snprintf(err, sizeof(err), "{\"error\":\"Invalid queueType '%s'. Supported: DropTail, CoDel, RED, FqCoDel, PIE\"}", raw_queue_type);
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    // Strict validation of numeric parameters
+    int q_size = atoi(queue_size);
+    if (q_size < 1 || q_size > 10000) {
+        const char* err = "{\"error\":\"Invalid queueSize. Must be integer between 1 and 10000.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    double bot_bw = atof(bottleneck_bw);
+    if (bot_bw <= 0.0 || bot_bw > 1000.0) {
+        const char* err = "{\"error\":\"Invalid bottleneckBw. Must be between 0.1 and 1000.0 Mbps.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    double bot_delay = atof(bottleneck_delay);
+    if (bot_delay < 0.0 || bot_delay > 5000.0) {
+        const char* err = "{\"error\":\"Invalid bottleneckDelay. Must be between 0.0 and 5000.0 ms.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    double acc_bw = atof(access_bw);
+    if (acc_bw <= 0.0 || acc_bw > 10000.0) {
+        const char* err = "{\"error\":\"Invalid accessBw. Must be between 0.1 and 10000.0 Mbps.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    double acc_delay = atof(access_delay);
+    if (acc_delay < 0.0 || acc_delay > 1000.0) {
+        const char* err = "{\"error\":\"Invalid accessDelay. Must be between 0.0 and 1000.0 ms.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    int clients = atoi(n_clients);
+    if (clients < 1 || clients > 50) {
+        const char* err = "{\"error\":\"Invalid nClients. Must be integer between 1 and 50.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    int pkt_size = atoi(packet_size);
+    if (pkt_size < 64 || pkt_size > 65535) {
+        const char* err = "{\"error\":\"Invalid packetSize. Must be integer between 64 and 65535 bytes.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    double duration = atof(sim_duration);
+    if (duration < 0.5 || duration > 300.0) {
+        const char* err = "{\"error\":\"Invalid simDuration. Must be between 0.5 and 300.0 seconds.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    int rng = atoi(rng_run);
+    if (rng < 1 || rng > 1000000) {
+        const char* err = "{\"error\":\"Invalid rngRun. Must be positive integer.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    // Validate trafficLoad
+    if (strcmp(traffic_load, "low") != 0 &&
+        strcmp(traffic_load, "medium") != 0 &&
+        strcmp(traffic_load, "high") != 0 &&
+        strcmp(traffic_load, "udp_competing") != 0 &&
+        strcmp(traffic_load, "competing_udp") != 0) {
+        const char* err = "{\"error\":\"Invalid trafficLoad. Must be low, medium, high, or udp_competing.\"}";
+        send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+        return;
+    }
+
+    // Validate expName if provided
+    if (strlen(exp_name) > 0) {
+        if (!is_safe_basename(exp_name)) {
+            const char* err = "{\"error\":\"Invalid expName: only alphanumeric characters, underscores, hyphens, and dots allowed.\"}";
+            send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
+            return;
+        }
+    } else {
         time_t t = time(NULL);
         struct tm tm_buf;
         localtime_r(&t, &tm_buf);
@@ -246,19 +396,22 @@ static void handle_api_simulate(int client_fd, const char* body) {
         // Child process
         char arg_clients[64], arg_bot_bw[64], arg_bot_del[64];
         char arg_acc_bw[64], arg_acc_del[64], arg_qtype[64], arg_qsize[64];
-        char arg_load[64], arg_pktsize[64], arg_dur[64], arg_rng[64], arg_outdir[2100];
+        char arg_load[64], arg_pktsize[64], arg_dur[64], arg_rng[64];
+        char arg_tcp[64], arg_udp[64], arg_outdir[2100];
 
-        snprintf(arg_clients, sizeof(arg_clients), "--nClients=%s", n_clients);
-        snprintf(arg_bot_bw, sizeof(arg_bot_bw), "--bottleneckBw=%s", bottleneck_bw);
-        snprintf(arg_bot_del, sizeof(arg_bot_del), "--bottleneckDelay=%s", bottleneck_delay);
-        snprintf(arg_acc_bw, sizeof(arg_acc_bw), "--accessBw=%s", access_bw);
-        snprintf(arg_acc_del, sizeof(arg_acc_del), "--accessDelay=%s", access_delay);
+        snprintf(arg_clients, sizeof(arg_clients), "--nClients=%d", clients);
+        snprintf(arg_bot_bw, sizeof(arg_bot_bw), "--bottleneckBw=%.2f", bot_bw);
+        snprintf(arg_bot_del, sizeof(arg_bot_del), "--bottleneckDelay=%.2f", bot_delay);
+        snprintf(arg_acc_bw, sizeof(arg_acc_bw), "--accessBw=%.2f", acc_bw);
+        snprintf(arg_acc_del, sizeof(arg_acc_del), "--accessDelay=%.2f", acc_delay);
         snprintf(arg_qtype, sizeof(arg_qtype), "--queueType=%s", queue_type);
-        snprintf(arg_qsize, sizeof(arg_qsize), "--queueSize=%s", queue_size);
+        snprintf(arg_qsize, sizeof(arg_qsize), "--queueSize=%d", q_size);
         snprintf(arg_load, sizeof(arg_load), "--trafficLoad=%s", traffic_load);
-        snprintf(arg_pktsize, sizeof(arg_pktsize), "--packetSize=%s", packet_size);
-        snprintf(arg_dur, sizeof(arg_dur), "--simDuration=%s", sim_duration);
-        snprintf(arg_rng, sizeof(arg_rng), "--rngRun=%s", rng_run);
+        snprintf(arg_pktsize, sizeof(arg_pktsize), "--packetSize=%d", pkt_size);
+        snprintf(arg_dur, sizeof(arg_dur), "--simDuration=%.1f", duration);
+        snprintf(arg_rng, sizeof(arg_rng), "--rngRun=%d", rng);
+        snprintf(arg_tcp, sizeof(arg_tcp), "--tcpProtocol=%s", tcp_proto);
+        snprintf(arg_udp, sizeof(arg_udp), "--enableUdp=%s", (strcmp(traffic_load, "udp_competing") == 0 || atoi(enable_udp) > 0) ? "1" : "0");
         snprintf(arg_outdir, sizeof(arg_outdir), "--outputDir=%s", target_dir);
 
         char* argv[] = {
@@ -274,6 +427,8 @@ static void handle_api_simulate(int client_fd, const char* body) {
             arg_pktsize,
             arg_dur,
             arg_rng,
+            arg_tcp,
+            arg_udp,
             arg_outdir,
             NULL
         };
@@ -346,15 +501,15 @@ static void handle_api_results(int client_fd) {
             char metric[64], val[64], unit[32];
             if (sscanf(line, "%63[^,],%63[^,],%31[^\r\n]", metric, val, unit) >= 2) {
                 if (strcmp(metric, "queue_type") == 0) snprintf(qtype, sizeof(qtype), "%s", val);
-                else if (strcmp(metric, "queue_capacity_packets") == 0) snprintf(qcap, sizeof(qcap), "%s", val);
+                else if (strcmp(metric, "queue_capacity_packets") == 0 || strcmp(metric, "queue_size_pkts") == 0) snprintf(qcap, sizeof(qcap), "%s", val);
                 else if (strcmp(metric, "bottleneck_bw_mbps") == 0) snprintf(bot_bw, sizeof(bot_bw), "%s", val);
                 else if (strcmp(metric, "baseline_rtt_ms") == 0) snprintf(base_rtt, sizeof(base_rtt), "%s", val);
-                else if (strcmp(metric, "avg_loaded_rtt_ms") == 0) snprintf(rtt_loaded, sizeof(rtt_loaded), "%s", val);
+                else if (strcmp(metric, "avg_loaded_rtt_ms") == 0 || strcmp(metric, "loaded_mean_rtt_ms") == 0) snprintf(rtt_loaded, sizeof(rtt_loaded), "%s", val);
                 else if (strcmp(metric, "avg_queueing_delay_ms") == 0) snprintf(qdelay, sizeof(qdelay), "%s", val);
-                else if (strcmp(metric, "avg_throughput_mbps") == 0) snprintf(avg_tp, sizeof(avg_tp), "%s", val);
+                else if (strcmp(metric, "avg_throughput_mbps") == 0 || strcmp(metric, "mean_throughput_mbps") == 0) snprintf(avg_tp, sizeof(avg_tp), "%s", val);
                 else if (strcmp(metric, "packet_loss_percent") == 0) snprintf(loss, sizeof(loss), "%s", val);
                 else if (strcmp(metric, "bufferbloat_detected") == 0) snprintf(bloat, sizeof(bloat), "%s", val);
-                else if (strcmp(metric, "bufferbloat_grade") == 0) snprintf(grade, sizeof(grade), "%s", val);
+                else if (strcmp(metric, "bufferbloat_grade") == 0 || strcmp(metric, "grade") == 0) snprintf(grade, sizeof(grade), "%s", val);
             }
         }
         fclose(f);
@@ -404,7 +559,7 @@ static void handle_api_data(int client_fd, const char* url) {
     get_query_param(url, "exp", exp, sizeof(exp));
     get_query_param(url, "file", file, sizeof(file));
 
-    if (!is_safe_filename(exp) || !is_safe_filename(file)) {
+    if (!is_safe_filename(exp) || !is_safe_basename(file) || !is_allowed_file_extension(file)) {
         const char* err = "{\"error\":\"Invalid experiment or filename parameter\"}";
         send_response(client_fd, 400, "Bad Request", "application/json", err, strlen(err));
         return;
@@ -631,6 +786,13 @@ int run_server(void) {
 }
 
 void stop_server(void) {
+    if (g_server_state.is_running && g_server_state.current_pid > 0) {
+        printf("[C Socket Server] Terminating active simulation process (PID %d)...\n", g_server_state.current_pid);
+        kill(g_server_state.current_pid, SIGTERM);
+        int status = 0;
+        waitpid(g_server_state.current_pid, &status, 0);
+        g_server_state.is_running = false;
+    }
     if (g_listen_fd >= 0) {
         close(g_listen_fd);
         g_listen_fd = -1;

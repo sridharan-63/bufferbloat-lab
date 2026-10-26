@@ -1,9 +1,9 @@
 === NS-3 BufferBloat Simulation Completed Successfully ===
-Queue Type: DropTail | Buffer Size: 100 pkts
-Baseline RTT: 74.3158 ms | Loaded RTT: 159.236 ms
-Peak RTT: 246.442 ms | RTT Ratio: 2.14269x
-Avg Queueing Delay: 91.8535 ms | Peak Queueing Delay: 170.873 ms
-Avg Throughput: 3.90282 Mbps | Utilization: 78.0565%
-Packet Loss: 1.92554% (256 dropped)
-BufferBloat Detected: YES | Grade: C
-Results saved to: results/run_20261026_062521_DropTail
+Queue Type: FqCoDel | Buffer Size: 100 pkts
+Baseline RTT: 74.3158 ms | Loaded RTT: 76.9197 ms
+Peak RTT: 81.1923 ms | RTT Ratio: 1.03504x
+Avg Queueing Delay: 12.6563 ms | Peak Queueing Delay: 169.745 ms
+Avg Throughput: 3.8519 Mbps | Utilization: 77.038%
+Packet Loss: 0.865823% (169 dropped)
+BufferBloat Detected: NO | Grade: A+
+Results saved to: results/run_20261026_170612_FqCoDel

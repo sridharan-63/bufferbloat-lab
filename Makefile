@@ -5,7 +5,7 @@ CFLAGS ?= -O2 -Wall -Wextra -Icontroller
 
 SIM_SRC = simulation/bufferbloat.cc
 SIM_BIN = simulation/bufferbloat
-SIM_LIBS = -lns3-core -lns3-network -lns3-internet -lns3-point-to-point -lns3-applications -lns3-traffic-control
+SIM_LIBS = -lns3-core -lns3-network -lns3-internet -lns3-point-to-point -lns3-applications -lns3-traffic-control -lns3-flow-monitor
 
 CTRL_SRC = controller/main.c controller/socket_server.c
 CTRL_BIN = controller/server
